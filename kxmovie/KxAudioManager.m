@@ -19,14 +19,19 @@
 #import <Accelerate/Accelerate.h>
 #import "KxLogger.h"
 
+@import AVFoundation;
+
 #define MAX_FRAME_SIZE 4096
 #define MAX_CHAN       2
 
 #define MAX_SAMPLE_DUMPED 5
 
 static BOOL checkError(OSStatus error, const char *operation);
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 static void sessionPropertyListener(void *inClientData, AudioSessionPropertyID inID, UInt32 inDataSize, const void *inData);
 static void sessionInterruptionListener(void *inClientData, UInt32 inInterruption);
+#endif //KXVIDEO_VIEW_CUSTOM
 static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioActionFlags, const AudioTimeStamp * inTimeStamp, UInt32 inOutputBusNumber, UInt32 inNumberFrames, AudioBufferList* ioData);
 
 
@@ -91,6 +96,9 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
 
 - (void)dealloc
 {
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionInterruptionNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:AVAudioSessionRouteChangeNotification object:nil];
+
     if (_outData) {
         
         free(_outData);
@@ -149,7 +157,43 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
 - (BOOL) setupAudio
 {
     // --- Audio Session Setup ---
+
+#ifdef KXVIDEO_VIEW_CUSTOM
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    
+        NSError * error = nil;
+        if ([audioSession setCategory:AVAudioSessionCategoryPlayAndRecord error:&error] == NO) {
+            if (error != nil) {
+                NSLogF(@"AudioManager setupAudio error(setCategory) => %@ ", error);
+            }
         
+            return NO;
+        }
+    
+    // Set the buffer size, this will affect the number of samples that get rendered every time the audio callback is fired
+    // A small number will get you lower latency audio, but will make your processor work harder
+    
+#if !TARGET_IPHONE_SIMULATOR
+    Float32 preferredBufferSize = 0.0232;
+    
+        if ([audioSession setPreferredIOBufferDuration:preferredBufferSize error:&error] == NO) {
+            if (error != nil) {
+                NSLogF(@"AudioManager setupAudio error(setCategory) => %@ ", error);
+            }
+            
+            return NO;
+        }
+#endif
+        
+        if ([audioSession setActive:YES error:&error] == NO) {
+            if (error != nil) {
+                NSLogF(@"AudioManager setupAudio error(setCategory) => %@ ", error);
+            }
+            
+            return NO;
+        }
+
+#else //KXVIDEO_VIEW_CUSTOM
     UInt32 sessionCategory = kAudioSessionCategory_MediaPlayback;
     //UInt32 sessionCategory = kAudioSessionCategory_PlayAndRecord;
     if (checkError(AudioSessionSetProperty(kAudioSessionProperty_AudioCategory,
@@ -192,6 +236,8 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
     if (checkError(AudioSessionSetActive(YES),
                    "Couldn't activate the audio session"))
         return NO;
+    
+#endif //KXVIDEO_VIEW_CUSTOM
     
     [self checkSessionProperties];
     
@@ -239,8 +285,8 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
     _numBytesPerSample = _outputFormat.mBitsPerChannel / 8;
     _numOutputChannels = _outputFormat.mChannelsPerFrame;
     
-    LoggerAudio(2, @"Current output bytes per sample: %ld", _numBytesPerSample);
-    LoggerAudio(2, @"Current output num channels: %ld", _numOutputChannels);
+    LoggerAudio(2, @"Current output bytes per sample: %u", (unsigned int)_numBytesPerSample);
+    LoggerAudio(2, @"Current output num channels: %u", (unsigned int)_numOutputChannels);
             
     // Slap a render callback on the unit
     AURenderCallbackStruct callbackStruct;
@@ -265,6 +311,26 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
 
 - (BOOL) checkSessionProperties
 {
+#ifdef KXVIDEO_VIEW_CUSTOM
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    
+    // Check the number of output channels.
+    UInt32 newNumChannels;
+    
+        [audioSession setCategory:AVAudioSessionCategoryPlayAndRecord error:nil];
+        
+        newNumChannels = (UInt32)audioSession.outputNumberOfChannels;
+    
+    LoggerAudio(2, @"We've got %u output channels", (unsigned int)newNumChannels);
+    
+    // Get the hardware sampling rate. This is settable, but here we're only reading.
+        _samplingRate = audioSession.sampleRate;
+    
+    LoggerAudio(2, @"Current sampling rate: %f", _samplingRate);
+    
+        _outputVolume = audioSession.outputVolume;
+    
+#else //KXVIDEO_VIEW_CUSTOM
     [self checkAudioRoute];
     
     // Check the number of output channels.
@@ -295,6 +361,8 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
                                            &_outputVolume),
                    "Checking current hardware output volume"))
         return NO;
+    
+#endif //KXVIDEO_VIEW_CUSTOM
     
     LoggerAudio(1, @"Current output volume: %f", _outputVolume);
     
@@ -366,6 +434,40 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
 {
     if (!_activated) {
         
+#ifdef KXVIDEO_VIEW_CUSTOM
+        if (!_initialized) {
+            
+//            AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+            
+//                [audioSession setMode:kCFRunLoopDefaultMode error:nil];
+                [[NSNotificationCenter defaultCenter] addObserver:self
+                                                         selector:@selector(interruption:)
+                                                             name:AVAudioSessionInterruptionNotification
+                                                           object:nil];
+                
+                [[NSNotificationCenter defaultCenter] addObserver:self
+                                                         selector:@selector(audioRouteChangeListenerCallback:)
+                                                             name:AVAudioSessionRouteChangeNotification
+                                                           object:nil];
+//            else {
+//                if (checkError(AudioSessionInitialize(NULL,
+//                                                      kCFRunLoopDefaultMode,
+//                                                      sessionInterruptionListener,
+//                                                      (__bridge void *)(self)),
+//                               "Couldn't initialize audio session"))
+//                    return NO;
+//            }
+            
+            _initialized = YES;
+        }
+        
+        // AudioRoute : Speaker or Headphones
+        if ([self setupAudio]) {
+            
+            _activated = YES;
+        }
+
+#else //KXVIDEO_VIEW_CUSTOM
         if (!_initialized) {
             
             if (checkError(AudioSessionInitialize(NULL,
@@ -383,6 +485,8 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
             
             _activated = YES;
         }
+        
+#endif //KXVIDEO_VIEW_CUSTOM
     }
     
     return _activated;
@@ -409,21 +513,28 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
                    "Couldn't clear the render callback on the audio unit");
         */
                 
-        checkError(AudioComponentInstanceDispose(_audioUnit),
-                   "Couldn't dispose the output audio unit");
-                
-        checkError(AudioSessionSetActive(NO),
-                   "Couldn't deactivate the audio session");        
-        
-        checkError(AudioSessionRemovePropertyListenerWithUserData(kAudioSessionProperty_AudioRouteChange,
-                                                                  sessionPropertyListener,
-                                                                  (__bridge void *)(self)),
-                   "Couldn't remove audio session property listener");
-        
-        checkError(AudioSessionRemovePropertyListenerWithUserData(kAudioSessionProperty_CurrentHardwareOutputVolume,
-                                                                  sessionPropertyListener,
-                                                                  (__bridge void *)(self)),
-                   "Couldn't remove audio session property listener");
+#ifdef KXVIDEO_VIEW_CUSTOM
+
+#else //KXVIDEO_VIEW_CUSTOM
+        if (([KxManager camType] == KxMovieCamTypeLG) ||
+            ([KxManager camType] == KxMovieCamTypeXiaoyi)) {
+            checkError(AudioComponentInstanceDispose(_audioUnit),
+                       "Couldn't dispose the output audio unit");
+            
+            checkError(AudioSessionSetActive(NO),
+                       "Couldn't deactivate the audio session");
+            
+            checkError(AudioSessionRemovePropertyListenerWithUserData(kAudioSessionProperty_AudioRouteChange,
+                                                                      sessionPropertyListener,
+                                                                      (__bridge void *)(self)),
+                       "Couldn't remove audio session property listener");
+            
+            checkError(AudioSessionRemovePropertyListenerWithUserData(kAudioSessionProperty_CurrentHardwareOutputVolume,
+                                                                      sessionPropertyListener,
+                                                                      (__bridge void *)(self)),
+                       "Couldn't remove audio session property listener");
+        }
+#endif //KXVIDEO_VIEW_CUSTOM
         
         _activated = NO;
     }
@@ -451,6 +562,103 @@ static OSStatus renderCallback (void *inRefCon, AudioUnitRenderActionFlags	*ioAc
     
     return _playing;
 }
+
+
+#ifdef KXVIDEO_VIEW_CUSTOM
+#pragma mark - Interruption
+
+- (void)audioRouteChangeListenerCallback:(NSNotification*)notification
+{
+    NSDictionary *interuptionDict = notification.userInfo;
+    
+    NSInteger routeChangeReason = [[interuptionDict valueForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
+    AVAudioSession *audioSession = [AVAudioSession sharedInstance];
+    
+    switch (routeChangeReason) {
+            
+        case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
+            NSLog(@"AVAudioSessionRouteChangeReasonNewDeviceAvailable");
+            NSLog(@"Headphone/Line plugged in");
+            [audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideNone
+                                            error:nil];
+            break;
+            
+        case AVAudioSessionRouteChangeReasonOldDeviceUnavailable:
+            NSLog(@"AVAudioSessionRouteChangeReasonOldDeviceUnavailable");
+            NSLog(@"Headphone/Line was pulled. Stopping player....");
+            [audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker
+                                            error:nil];
+            break;
+            
+        case AVAudioSessionRouteChangeReasonCategoryChange:{
+            // called at start - also when other audio wants to play
+            
+            NSArray * arrOutput = audioSession.currentRoute.outputs;
+            
+            
+            if (arrOutput == nil || [arrOutput count] == 0)
+            {
+                [audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker
+                                                error:nil];
+                
+            }else{
+                
+                AVAudioSessionPortDescription * portDesc = [arrOutput objectAtIndex:0];
+                _audioRoute = portDesc.portType;
+                
+                
+                if([_audioRoute isEqualToString:@"Headphones"]){
+                    [audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideNone
+                                                    error:nil];
+                }else{
+                    [audioSession overrideOutputAudioPort:AVAudioSessionPortOverrideSpeaker
+                                                    error:nil];
+                }
+                NSLog(@"_audioRoute %@",_audioRoute);
+            }
+            
+            
+            NSLog(@"AVAudioSessionRouteChangeReasonCategoryChange");
+            
+            break;
+    }
+}
+}
+- (void)interruption:(NSNotification*)notification {
+    // get the user info dictionary
+    NSDictionary *interuptionDict = notification.userInfo;
+    // get the AVAudioSessionInterruptionTypeKey enum from the dictionary
+    NSInteger interuptionType = [[interuptionDict valueForKey:AVAudioSessionInterruptionTypeKey] integerValue];
+    // decide what to do based on interruption type here...
+    switch (interuptionType) {
+        case AVAudioSessionInterruptionTypeBegan: {
+            NSLog(@"Audio Session Interruption case started.");
+
+            self.playAfterSessionEndInterruption = self.playing;
+            [self pause];
+        }
+            break;
+            
+        case AVAudioSessionInterruptionTypeEnded: {
+            NSLog(@"Audio Session Interruption case ended.");
+
+            if (self.playAfterSessionEndInterruption) {
+                self.playAfterSessionEndInterruption = NO;
+                [self play];
+            }
+        }
+            break;
+            
+        default:
+            NSLog(@"Audio Session Interruption Notification case default.");
+            break;
+    }
+    
+}
+
+@end
+
+#else //KXVIDEO_VIEW_CUSTOM
 
 @end
 
@@ -497,6 +705,8 @@ static void sessionInterruptionListener(void *inClientData, UInt32 inInterruptio
         }
 	}
 }
+
+#endif //KXVIDEO_VIEW_CUSTOM
 
 static OSStatus renderCallback (void						*inRefCon,
                                 AudioUnitRenderActionFlags	* ioActionFlags,

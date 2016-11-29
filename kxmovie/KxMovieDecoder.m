@@ -17,10 +17,26 @@
 #include "libavutil/pixdesc.h"
 #import "KxAudioManager.h"
 #import "KxLogger.h"
+#include <stdlib.h>
+#import "MuteChecker.h"
 
 ////////////////////////////////////////////////////////////////////////////////
-NSString * kxmovieErrorDomain = @"ru.kolyvan.kxmovie";
+NSString * kxmovieErrorDomain = @"com.test.server";
 static void FFLog(void* context, int level, const char* format, va_list args);
+
+static int h264_codec_info(unsigned char* data)
+{
+    switch (data[4] & 0x5) {
+        case 5:
+            return 5;
+            
+        case 1:
+            return 1;
+            
+        default:
+            return 0;
+    }
+}
 
 static NSError * kxmovieError (NSInteger code, id info)
 {
@@ -88,6 +104,8 @@ static BOOL audioCodecIsSupported(AVCodecContext *audio)
     return NO;
 }
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 #ifdef DEBUG
 static void fillSignal(SInt16 *outData,  UInt32 numFrames, UInt32 numChannels)
 {
@@ -213,6 +231,7 @@ static void testConvertYUV420pToRGB(AVFrame * frame, uint8_t *outbuf, int linesi
     }
 }
 #endif
+#endif //KXVIDEO_VIEW_CUSTOM
 
 static void avStreamFPSTimeBase(AVStream *st, CGFloat defaultTimeBase, CGFloat *pFPS, CGFloat *pTimeBase)
 {
@@ -385,6 +404,8 @@ static int interrupt_callback(void *ctx);
 }
 @end
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 @interface KxSubtitleFrame()
 @property (readwrite, nonatomic, strong) NSString *text;
 @end
@@ -392,11 +413,36 @@ static int interrupt_callback(void *ctx);
 @implementation KxSubtitleFrame
 - (KxMovieFrameType) type { return KxMovieFrameTypeSubtitle; }
 @end
+#endif //KXVIDEO_VIEW_CUSTOM
 
 ////////////////////////////////////////////////////////////////////////////////
 
 @interface KxMovieDecoder () {
     
+#ifdef KXVIDEO_VIEW_CUSTOM
+    AVFormatContext     *_formatCtx;
+	AVCodecContext      *_videoCodecCtx;
+    AVCodecContext      *_audioCodecCtx;
+    AVFrame             *_videoFrame;
+    AVFrame             *_audioFrame;
+    NSInteger           _videoStream;
+    NSInteger           _audioStream;
+	AVPicture           _picture;
+    BOOL                _pictureValid;
+    struct SwsContext   *_swsContext;
+    CGFloat             _videoTimeBase;
+    CGFloat             _audioTimeBase;
+    CGFloat             _position;
+    NSArray             *_videoStreams;
+    NSArray             *_audioStreams;
+    SwrContext          *_swrContext;
+    void                *_swrBuffer;
+    NSUInteger          _swrBufferSize;
+    NSDictionary        *_info;
+    KxVideoFrameFormat  _videoFrameFormat;
+    NSUInteger          _artworkStream;
+
+#else //KXVIDEO_VIEW_CUSTOM
     AVFormatContext     *_formatCtx;
 	AVCodecContext      *_videoCodecCtx;
     AVCodecContext      *_audioCodecCtx;
@@ -422,11 +468,46 @@ static int interrupt_callback(void *ctx);
     KxVideoFrameFormat  _videoFrameFormat;
     NSUInteger          _artworkStream;
     NSInteger           _subtitleASSEvents;
+	
+#endif //KXVIDEO_VIEW_CUSTOM
+
+    //open output file
+    AVOutputFormat      *fmt;
+    AVFormatContext     *oc;
+    AVStream            *recordVideoStream;
+    //AVStream            *recordAudioStream;
+    int64_t             _pts;
+    int64_t             _dts;
+    int64_t             _audioPts;
+    int64_t             _audioDts;
+    BOOL                isFirstIframeRec;
+    int                 recordBaseDen;
+    int                 recordPktBaseDen;
+    BOOL                isRecord;
+	int  				_interruptCount;
 }
+
+@property (nonatomic, strong) MuteChecker *muteChecker; // 벨소리 진동여부 체크
+@property (nonatomic, assign) BOOL isRingerSilent;      // 벨소리 진동여부
+
 @end
 
 @implementation KxMovieDecoder
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+@dynamic duration;
+@dynamic position;
+@dynamic frameWidth;
+@dynamic frameHeight;
+@dynamic sampleRate;
+@dynamic audioStreamsCount;
+@dynamic selectedAudioStream;
+@dynamic validAudio;
+@dynamic validVideo;
+@dynamic info;
+@dynamic videoStreamFormatName;
+@dynamic startTime;
+#else //KXVIDEO_VIEW_CUSTOM
 @dynamic duration;
 @dynamic position;
 @dynamic frameWidth;
@@ -442,6 +523,25 @@ static int interrupt_callback(void *ctx);
 @dynamic info;
 @dynamic videoStreamFormatName;
 @dynamic startTime;
+
+#endif //KXVIDEO_VIEW_CUSTOM
+
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        _pts = -1;
+        _dts = -1;
+        _audioPts = -1;
+        _audioDts = -1;
+        _isStop = NO;
+        
+        _interruptCount = 0;
+        _isCloseInput = NO;
+    }
+    
+    return self;
+}
 
 - (CGFloat) duration
 {
@@ -461,16 +561,16 @@ static int interrupt_callback(void *ctx);
 {
     _position = seconds;
     _isEOF = NO;
-	   
+    
     if (_videoStream != -1) {
         int64_t ts = (int64_t)(seconds / _videoTimeBase);
-        avformat_seek_file(_formatCtx, _videoStream, ts, ts, ts, AVSEEK_FLAG_FRAME);
+        avformat_seek_file(_formatCtx, (int)_videoStream, ts, ts, ts, AVSEEK_FLAG_FRAME);
         avcodec_flush_buffers(_videoCodecCtx);
     }
     
     if (_audioStream != -1) {
         int64_t ts = (int64_t)(seconds / _audioTimeBase);
-        avformat_seek_file(_formatCtx, _audioStream, ts, ts, ts, AVSEEK_FLAG_FRAME);
+        avformat_seek_file(_formatCtx, (int)_audioStream, ts, ts, ts, AVSEEK_FLAG_FRAME);
         avcodec_flush_buffers(_audioCodecCtx);
     }
 }
@@ -495,10 +595,13 @@ static int interrupt_callback(void *ctx);
     return [_audioStreams count];
 }
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 - (NSUInteger) subtitleStreamsCount
 {
     return [_subtitleStreams count];
 }
+#endif //KXVIDEO_VIEW_CUSTOM
 
 - (NSInteger) selectedAudioStream
 {
@@ -517,6 +620,9 @@ static int interrupt_callback(void *ctx);
         LoggerAudio(0, @"%@", errorMessage(errCode));
     }
 }
+
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 
 - (NSInteger) selectedSubtitleStream
 {
@@ -542,6 +648,7 @@ static int interrupt_callback(void *ctx);
         }
     }
 }
+#endif //KXVIDEO_VIEW_CUSTOM
 
 - (BOOL) validAudio
 {
@@ -553,10 +660,13 @@ static int interrupt_callback(void *ctx);
     return _videoStream != -1;
 }
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 - (BOOL) validSubtitles
 {
     return _subtitleStream != -1;
 }
+#endif //KXVIDEO_VIEW_CUSTOM
 
 - (NSDictionary *) info
 {
@@ -565,7 +675,7 @@ static int interrupt_callback(void *ctx);
         NSMutableDictionary *md = [NSMutableDictionary dictionary];
         
         if (_formatCtx) {
-        
+            
             const char *formatName = _formatCtx->iformat->name;
             [md setValue: [NSString stringWithCString:formatName encoding:NSUTF8StringEncoding]
                   forKey: @"format"];
@@ -589,7 +699,7 @@ static int interrupt_callback(void *ctx);
                 
                 [md setValue: [md1 copy] forKey: @"metadata"];
             }
-        
+            
             char buf[256];
             
             if (_videoStreams.count) {
@@ -627,6 +737,8 @@ static int interrupt_callback(void *ctx);
                 md[@"audio"] = ma.copy;
             }
             
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
             if (_subtitleStreams.count) {
                 NSMutableArray *ma = [NSMutableArray array];
                 for (NSNumber *n in _subtitleStreams) {
@@ -648,6 +760,7 @@ static int interrupt_callback(void *ctx);
                 }               
                 md[@"subtitles"] = ma.copy;
             }
+#endif //KXVIDEO_VIEW_CUSTOM
             
         }
                 
@@ -686,7 +799,7 @@ static int interrupt_callback(void *ctx);
             return st->start_time * _audioTimeBase;
         return 0;
     }
-        
+    
     return 0;
 }
 
@@ -710,7 +823,9 @@ static int interrupt_callback(void *ctx);
 - (void) dealloc
 {
     LoggerStream(2, @"%@ dealloc", self);
+    _isStop = YES;
     [self closeFile];
+    
 }
 
 #pragma mark - private
@@ -721,7 +836,10 @@ static int interrupt_callback(void *ctx);
     NSAssert(path, @"nil path");
     NSAssert(!_formatCtx, @"already open");
     
+    isRecord = NO;
+    _isStop  = NO;
     _isNetwork = isNetworkPath(path);
+    _isNetwork = YES;
     
     static BOOL needNetworkInit = YES;
     if (needNetworkInit && _isNetwork) {
@@ -731,7 +849,7 @@ static int interrupt_callback(void *ctx);
     }
     
     _path = path;
-    
+    NSLog(@"OpenFile Path : %@", path);
     kxMovieError errCode = [self openInput: path];
     
     if (errCode == kxMovieErrorNone) {
@@ -739,7 +857,10 @@ static int interrupt_callback(void *ctx);
         kxMovieError videoErr = [self openVideoStream];
         kxMovieError audioErr = [self openAudioStream];
         
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
         _subtitleStream = -1;
+#endif //KXVIDEO_VIEW_CUSTOM
         
         if (videoErr != kxMovieErrorNone &&
             audioErr != kxMovieErrorNone) {
@@ -748,7 +869,10 @@ static int interrupt_callback(void *ctx);
             
         } else {
             
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
             _subtitleStreams = collectStreams(_formatCtx, AVMEDIA_TYPE_SUBTITLE);
+#endif //KXVIDEO_VIEW_CUSTOM
         }
     }
     
@@ -762,6 +886,14 @@ static int interrupt_callback(void *ctx);
         return NO;
     }
         
+    // 벨소리가 진동인지 아닌지 체크한다.
+    if (self.muteChecker == nil) {
+        self.muteChecker = [[MuteChecker alloc] initWithCompletionBlk:^(NSTimeInterval lapse, BOOL muted) {
+            self.isRingerSilent = muted;
+        }];
+    }
+    [self.muteChecker check];
+    
     return YES;
 }
 
@@ -779,6 +911,47 @@ static int interrupt_callback(void *ctx);
         formatCtx->interrupt_callback = cb;
     }
     
+#ifdef KXVIDEO_VIEW_CUSTOM
+    // Set the RTSP Options
+    AVDictionary *opts = 0;
+    av_dict_set(&opts, "rtsp_transport", "udp", 0);
+    av_dict_set(&opts, "pixel_format", "yuv24", 0);
+    
+    av_dict_set(&opts, "stimeout", "2000000", 0);
+    //    av_dict_set(&opts, "timeout", "10000000", 0); // in microseconds.
+    
+    //    av_dict_set(&opts, "pix_fmt", "yuv420p", 0);
+    //    av_dict_set(&opts, "c:v", "libx264", 0);
+    //    av_dict_set(&opts, "c:a", "libfaac", 0);
+    //
+    //    av_dict_set(&opts, "vcodec", "h264", 0);
+    //    av_dict_set(&opts, "tune", "zerolatency", 0);
+    //    av_dict_set(&opts, "preset", "v", 0);
+    //    av_dict_set(&opts, "vprofile", "main", 0);
+    //    av_dict_set(&opts, "x264opts", "keyint=25:min-keyint=25", 0);
+    //    av_dict_set(&opts, "maxrate", "2000k", 0);
+    //    av_dict_set(&opts, "bufsize", "2000k", 0);
+    //    av_dict_set(&opts, "vcodec", "libx264", 0);
+    
+    
+    if (avformat_open_input(&formatCtx, [path UTF8String], NULL, &opts) < 0) {
+//    if (avformat_open_input(&formatCtx, [path UTF8String], NULL, NULL) < 0) {
+        
+        if (formatCtx)
+            avformat_free_context(formatCtx);
+		av_dict_free(&opts);
+        return kxMovieErrorOpenFile;
+    }
+    
+    int nErrorCode = avformat_find_stream_info(formatCtx, NULL);
+    
+    if (nErrorCode < 0) {
+        
+        avformat_close_input(&formatCtx);
+        return kxMovieErrorStreamInfoNotFound;
+    }
+    
+#else //KXVIDEO_VIEW_CUSTOM
     if (avformat_open_input(&formatCtx, [path cStringUsingEncoding: NSUTF8StringEncoding], NULL, NULL) < 0) {
         
         if (formatCtx)
@@ -792,6 +965,8 @@ static int interrupt_callback(void *ctx);
         return kxMovieErrorStreamInfoNotFound;
     }
 
+#endif //KXVIDEO_VIEW_CUSTOM
+    
     av_dump_format(formatCtx, 0, [path.lastPathComponent cStringUsingEncoding: NSUTF8StringEncoding], false);
     
     _formatCtx = formatCtx;
@@ -807,9 +982,9 @@ static int interrupt_callback(void *ctx);
     for (NSNumber *n in _videoStreams) {
         
         const NSUInteger iStream = n.integerValue;
-
-        if (0 == (_formatCtx->streams[iStream]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
         
+        if (0 == (_formatCtx->streams[iStream]->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+            
             errCode = [self openVideoStream: iStream];
             if (errCode == kxMovieErrorNone)
                 break;
@@ -828,6 +1003,10 @@ static int interrupt_callback(void *ctx);
     // get a pointer to the codec context for the video stream
     AVCodecContext *codecCtx = _formatCtx->streams[videoStream]->codec;
     
+    //    if (codecCtx->codec_id == AV_CODEC_ID_NONE) {
+    //        codecCtx->codec_id = AV_CODEC_ID_H264;
+    //    }
+    
     // find the decoder for the video stream
     AVCodec *codec = avcodec_find_decoder(codecCtx->codec_id);
     if (!codec)
@@ -843,7 +1022,7 @@ static int interrupt_callback(void *ctx);
         return kxMovieErrorOpenCodec;
         
     _videoFrame = av_frame_alloc();
-
+    
     if (!_videoFrame) {
         avcodec_close(codecCtx);
         return kxMovieErrorAllocateFrame;
@@ -857,9 +1036,9 @@ static int interrupt_callback(void *ctx);
     AVStream *st = _formatCtx->streams[_videoStream];
     avStreamFPSTimeBase(st, 0.04, &_fps, &_videoTimeBase);
     
-    LoggerVideo(1, @"video codec size: %d:%d fps: %.3f tb: %f",
-                self.frameWidth,
-                self.frameHeight,
+    LoggerVideo(1, @"video codec size: %lu:%d fps: %.3f tb: %f",
+                (unsigned long)self.frameWidth,
+                (int)self.frameHeight,
                 _fps,
                 _videoTimeBase);
     
@@ -945,6 +1124,8 @@ static int interrupt_callback(void *ctx);
     return kxMovieErrorNone; 
 }
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 - (kxMovieError) openSubtitleStream: (NSInteger) subtitleStream
 {
     AVCodecContext *codecCtx = _formatCtx->streams[subtitleStream]->codec;
@@ -990,9 +1171,46 @@ static int interrupt_callback(void *ctx);
     
     return kxMovieErrorNone;
 }
+#endif //KXVIDEO_VIEW_CUSTOM
+
+- (void) closeDecode
+{
+    _isStop = YES;
+    
+    
+    //avformat_flush(_formatCtx);
+    //av_read_pause(_formatCtx);
+    
+    //_videoFrame = nil;
+}
 
 -(void) closeFile
 {
+#ifdef KXVIDEO_VIEW_CUSTOM
+    _videoStream = -1;
+    _audioStream = -1;
+    
+    [self closeAudioStream];
+    [self closeVideoStream];
+    
+    
+    _videoStreams = nil;
+    _audioStreams = nil;
+    
+    _isCloseInput = YES;
+    
+    // 2016.09.20. 수정.
+    // 2016.09.01. 주석처리. => "decodeFrames:" 메소드에서 처리.
+    if (_formatCtx) {
+        _formatCtx->interrupt_callback.opaque = NULL;
+        _formatCtx->interrupt_callback.callback = NULL;
+        
+        avformat_close_input(&_formatCtx);
+        
+        _formatCtx = NULL;
+    }
+    
+#else //KXVIDEO_VIEW_CUSTOM
     [self closeAudioStream];
     [self closeVideoStream];
     [self closeSubtitleStream];
@@ -1000,7 +1218,7 @@ static int interrupt_callback(void *ctx);
     _videoStreams = nil;
     _audioStreams = nil;
     _subtitleStreams = nil;
-    
+
     if (_formatCtx) {
         
         _formatCtx->interrupt_callback.opaque = NULL;
@@ -1009,6 +1227,8 @@ static int interrupt_callback(void *ctx);
         avformat_close_input(&_formatCtx);
         _formatCtx = NULL;
     }
+    
+#endif //KXVIDEO_VIEW_CUSTOM
 }
 
 - (void) closeVideoStream
@@ -1017,17 +1237,17 @@ static int interrupt_callback(void *ctx);
     
     [self closeScaler];
     
-    if (_videoFrame) {
-        
-        av_free(_videoFrame);
-        _videoFrame = NULL;
-    }
-    
     if (_videoCodecCtx) {
         
         avcodec_close(_videoCodecCtx);
         _videoCodecCtx = NULL;
     }
+    
+    if (_videoFrame) {
+        av_free(_videoFrame);
+        _videoFrame = NULL;
+    }
+    
 }
 
 - (void) closeAudioStream
@@ -1060,6 +1280,8 @@ static int interrupt_callback(void *ctx);
     }
 }
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 - (void) closeSubtitleStream
 {
     _subtitleStream = -1;
@@ -1070,6 +1292,7 @@ static int interrupt_callback(void *ctx);
         _subtitleCodecCtx = NULL;
     }
 }
+#endif //KXVIDEO_VIEW_CUSTOM
 
 - (void) closeScaler
 {
@@ -1111,6 +1334,9 @@ static int interrupt_callback(void *ctx);
 
 - (KxVideoFrame *) handleVideoFrame
 {
+    if (_isStop)
+        return nil;
+    
     if (!_videoFrame->data[0])
         return nil;
     
@@ -1120,20 +1346,23 @@ static int interrupt_callback(void *ctx);
             
         KxVideoFrameYUV * yuvFrame = [[KxVideoFrameYUV alloc] init];
         
-        yuvFrame.luma = copyFrameData(_videoFrame->data[0],
-                                      _videoFrame->linesize[0],
-                                      _videoCodecCtx->width,
-                                      _videoCodecCtx->height);
+        if(_videoFrame)
+            yuvFrame.luma = copyFrameData(_videoFrame->data[0],
+                                          _videoFrame->linesize[0],
+                                          _videoCodecCtx->width,
+                                          _videoCodecCtx->height);
         
-        yuvFrame.chromaB = copyFrameData(_videoFrame->data[1],
-                                         _videoFrame->linesize[1],
-                                         _videoCodecCtx->width / 2,
-                                         _videoCodecCtx->height / 2);
+        if(_videoFrame)
+            yuvFrame.chromaB = copyFrameData(_videoFrame->data[1],
+                                             _videoFrame->linesize[1],
+                                             _videoCodecCtx->width / 2,
+                                             _videoCodecCtx->height / 2);
         
-        yuvFrame.chromaR = copyFrameData(_videoFrame->data[2],
-                                         _videoFrame->linesize[2],
-                                         _videoCodecCtx->width / 2,
-                                         _videoCodecCtx->height / 2);
+        if(_videoFrame)
+            yuvFrame.chromaR = copyFrameData(_videoFrame->data[2],
+                                             _videoFrame->linesize[2],
+                                             _videoCodecCtx->width / 2,
+                                             _videoCodecCtx->height / 2);
         
         frame = yuvFrame;
     
@@ -1200,6 +1429,8 @@ static int interrupt_callback(void *ctx);
         return nil;
     
     id<KxAudioManager> audioManager = [KxAudioManager audioManager];
+    if(![audioManager playing])
+        return nil;
     
     const NSUInteger numChannels = audioManager.numOutputChannels;
     NSInteger numFrames;
@@ -1213,7 +1444,7 @@ static int interrupt_callback(void *ctx);
         
         const int bufSize = av_samples_get_buffer_size(NULL,
                                                        audioManager.numOutputChannels,
-                                                       _audioFrame->nb_samples * ratio,
+                                                       _audioFrame->nb_samples * (int)ratio,
                                                        AV_SAMPLE_FMT_S16,
                                                        1);
         
@@ -1226,7 +1457,7 @@ static int interrupt_callback(void *ctx);
         
         numFrames = swr_convert(_swrContext,
                                 outbuf,
-                                _audioFrame->nb_samples * ratio,
+                                _audioFrame->nb_samples * (int)ratio,
                                 (const uint8_t **)_audioFrame->data,
                                 _audioFrame->nb_samples);
         
@@ -1281,6 +1512,9 @@ static int interrupt_callback(void *ctx);
     return frame;
 }
 
+
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 - (KxSubtitleFrame *) handleSubtitle: (AVSubtitle *)pSubtitle
 {
     NSMutableString *ms = [NSMutableString string];
@@ -1328,6 +1562,7 @@ static int interrupt_callback(void *ctx);
     
     return frame;    
 }
+#endif //KXVIDEO_VIEW_CUSTOM
 
 - (BOOL) interruptDecoder
 {
@@ -1335,6 +1570,48 @@ static int interrupt_callback(void *ctx);
         return _interruptCallback();
     return NO;
 }
+
+- (void)convertFrameToRGB
+{
+    sws_scale(_swsContext,
+              (const uint8_t **)_videoFrame->data,
+              _videoFrame->linesize,
+              0,
+              _videoCodecCtx->height,
+              _picture.data,
+              _picture.linesize);
+}
+
+- (UIImage *)imageFromAVPicture: (AVPicture) pict
+                          width: (int) width
+                         height: (int) height
+{
+    CGBitmapInfo bitmapInfo = kCGBitmapByteOrderDefault;
+    CFDataRef data = CFDataCreateWithBytesNoCopy(kCFAllocatorDefault, pict.data[0], pict.linesize[0]*height,kCFAllocatorNull);
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData(data);
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGImageRef cgImage = CGImageCreate(width,
+                                       height,
+                                       8,
+                                       24,
+                                       pict.linesize[0],
+                                       colorSpace,
+                                       bitmapInfo,
+                                       provider,
+                                       NULL,
+                                       NO,
+                                       kCGRenderingIntentDefault);
+    CGColorSpaceRelease(colorSpace);
+    UIImage *image = [UIImage imageWithCGImage:cgImage];
+    
+    CGImageRelease(cgImage);
+    CGDataProviderRelease(provider);
+    CFRelease(data);
+    
+    
+    return image;
+}
+
 
 #pragma mark - public
 
@@ -1357,7 +1634,9 @@ static int interrupt_callback(void *ctx);
     if (_videoStream == -1 &&
         _audioStream == -1)
         return nil;
-
+    if( _isStop )
+        return nil;
+    
     NSMutableArray *result = [NSMutableArray array];
     
     AVPacket packet;
@@ -1366,19 +1645,68 @@ static int interrupt_callback(void *ctx);
     
     BOOL finished = NO;
     
+    
     while (!finished) {
+        if( _formatCtx == nil ){
+            //_isEOF = YES;
+            break;
+        }
         
-        if (av_read_frame(_formatCtx, &packet) < 0) {
+        if( _isStop ){
+             _isEOF = YES;
+            
+            // 2016.09.20. 수정.
+            [self closeFile];
+//            if (_formatCtx) {
+//                
+//                _formatCtx->interrupt_callback.opaque = NULL;
+//                _formatCtx->interrupt_callback.callback = NULL;
+//                
+//                avformat_close_input(&_formatCtx);
+//                
+//                _formatCtx = NULL;
+//            }
+            
+             break;
+        }
+        
+        //        if( _formatCtx->interrupt_callback.callback == NULL)
+        //            break;
+        
+        
+        if ( !_isStop && _formatCtx != NULL && av_read_frame(_formatCtx, &packet) < 0) {
             _isEOF = YES;
             break;
         }
         
         if (packet.stream_index ==_videoStream) {
-           
             int pktSize = packet.size;
             
+            if( _isStop ){
+                // 2016.09.20. 수정.
+                [self closeFile];
+                
+//                if (_formatCtx) {
+//                    
+//                    _formatCtx->interrupt_callback.opaque = NULL;
+//                    _formatCtx->interrupt_callback.callback = NULL;
+//                    
+//                    avformat_close_input(&_formatCtx);
+//                    
+//                    _formatCtx = NULL;
+//                }
+                break;
+            }
+            
             while (pktSize > 0) {
-                            
+                
+                if( _isStop ){
+                    _isEOF = YES;
+
+                    //return nil;
+                    break;
+                }
+                
                 int gotframe = 0;
                 int len = avcodec_decode_video2(_videoCodecCtx,
                                                 _videoFrame,
@@ -1391,15 +1719,23 @@ static int interrupt_callback(void *ctx);
                 }
                 
                 if (gotframe) {
-                    
+                    if( _isStop ){
+                        _isEOF = YES;
+                        break;
+                    }
                     if (!_disableDeinterlacing &&
                         _videoFrame->interlaced_frame) {
-
+                        
                         avpicture_deinterlace((AVPicture*)_videoFrame,
                                               (AVPicture*)_videoFrame,
                                               _videoCodecCtx->pix_fmt,
                                               _videoCodecCtx->width,
                                               _videoCodecCtx->height);
+                    }
+                    if( _isStop || _videoFrame == NULL )
+                    {
+                        _isEOF = YES;
+                        break;
                     }
                     
                     KxVideoFrame *frame = [self handleVideoFrame];
@@ -1409,18 +1745,86 @@ static int interrupt_callback(void *ctx);
                         
                         _position = frame.position;
                         decodedDuration += frame.duration;
-                        if (decodedDuration > minDuration)
+                        if (decodedDuration > minDuration) {
+                            //frame = nil;
                             finished = YES;
+                        }
+                    }
+                    else {
+                        //frame = nil;
+                        if( _isStop ){
+                            
+                            return nil;
+                        }
                     }
                 }
-                                
+                
+                if (0 == len){
+                    if( _isStop ){
+                        
+                        return nil;
+                    }
+                    
+                    break;
+                }
+                
+                pktSize -= len;
+            }
+            
+        }
+        else if (packet.stream_index == _audioStream) {
+            
+            // 벨소리가 진동인지 아닌지 체크한다.
+            [self.muteChecker check];
+            if ([KxManager playType] == KxMoviePlayTypeGallery) { //Gallery
+                // 벨소리가 진동이면 사운드를 출력하지 않는다.
+                if (self.isRingerSilent) {
+                    break;
+                }
+            }
+            
+            int pktSize = packet.size;
+            
+            while (pktSize > 0) {
+                
+                int gotframe = 0;
+                int len = avcodec_decode_audio4(_audioCodecCtx,
+                                                _audioFrame,
+                                                &gotframe,
+                                                &packet);
+                
+                if (len < 0) {
+                    LoggerAudio(0, @"decode audio error, skip packet");
+                    break;
+                }
+                
+                if (gotframe) {
+                    
+                    KxAudioFrame * frame = [self handleAudioFrame];
+                    if (frame) {
+                        
+                        [result addObject:frame];
+                        
+                        if (_videoStream == -1) {
+                            
+                            _position = frame.position;
+                            decodedDuration += frame.duration;
+                            if (decodedDuration > minDuration)
+                                finished = YES;
+                        }
+                    }
+                }
+                
                 if (0 == len)
                     break;
                 
                 pktSize -= len;
             }
-            
-        } else if (packet.stream_index == _audioStream) {
+        }
+        
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
+        else if (packet.stream_index == _audioStream) {
                         
             int pktSize = packet.size;
             
@@ -1502,26 +1906,259 @@ static int interrupt_callback(void *ctx);
                 pktSize -= len;
             }
         }
+        
+#endif //KXVIDEO_VIEW_CUSTOM
 
+        
+        if (isRecord) {
+
+            [self saveMP4Header];
+            
+            AVPacket newPacket = packet;
+            if (packet.stream_index == _videoStream) {
+                if (_pts == -1 && _dts == -1) {
+                    _pts = packet.pts;
+                    _dts = packet.dts;
+                }
+                
+                
+                //코덱정보 문제로 강제 세팅
+                oc->streams[_videoStream]->time_base.num = 1;
+                oc->streams[_videoStream]->time_base.den = recordPktBaseDen;
+                
+                
+                //처음 들어오는 Iframe 이전껀 무시
+                if (h264_codec_info(packet.data) == 5 && !isFirstIframeRec) {
+                    isFirstIframeRec = YES;
+                    _pts = packet.pts;
+                    _dts = packet.dts;
+                }
+                
+                if (isFirstIframeRec) {
+                    newPacket.pts = (av_rescale_q(packet.pts - _pts, _formatCtx->streams[_videoStream]->codec->time_base, oc->streams[_videoStream]->time_base) *_formatCtx->streams[_videoStream]->codec->ticks_per_frame);
+                    newPacket.dts = av_rescale_q(packet.dts - _dts, _formatCtx->streams[_videoStream]->codec->time_base, oc->streams[_videoStream]->time_base) *_formatCtx->streams[_videoStream]->codec->ticks_per_frame;
+                    
+                    //초 계산
+                    NSInteger secound = (int)newPacket.pts / oc->streams[_videoStream]->time_base.den;
+                    NSLog(@"secound %ld",(long)secound);
+
+                    av_write_frame(oc,&newPacket);
+                    
+                    //[[NSNotificationCenter defaultCenter] postNotificationName:RECORD_SECOUND_NOTIFICATION object:[NSNumber numberWithInt:(int)secound]];
+                    
+                }
+                
+            }
+            else if (packet.stream_index == _audioStream) {
+                if (_audioPts == -1 && _audioDts == -1) {
+                    _audioPts = packet.pts;
+                    _audioDts = packet.dts;
+                }
+                if (isFirstIframeRec) {
+                    newPacket.pts = (packet.pts - _audioPts) * _formatCtx->streams[packet.stream_index]->codec->ticks_per_frame;
+                    newPacket.dts = (packet.dts - _audioDts) * _formatCtx->streams[packet.stream_index]->codec->ticks_per_frame;
+                    
+                    av_write_frame(oc,&newPacket);
+                }
+            }
+        }
+        
         av_free_packet(&packet);
 	}
 
     return result;
 }
 
+- (void)saveMP4Header
+{
+    //if (recordVideoStream == NULL && recordAudioStream == NULL) {//create stream in file
+    if (recordVideoStream == NULL) {//create stream in file
+    
+        recordVideoStream = avformat_new_stream(oc,_formatCtx->streams[_videoStream]->codec->codec);
+        avcodec_copy_context(recordVideoStream->codec,_formatCtx->streams[_videoStream]->codec);
+        recordVideoStream->sample_aspect_ratio = _formatCtx->streams[_videoStream]->codec->sample_aspect_ratio;
+        
+        //recordAudioStream = avformat_new_stream(oc,_formatCtx->streams[_audioStream]->codec->codec);
+        //avcodec_copy_context(recordAudioStream->codec,_formatCtx->streams[_audioStream]->codec);
+        //recordAudioStream->sample_aspect_ratio = _formatCtx->streams[_audioStream]->codec->sample_aspect_ratio;
+        
+        //recordAudioStream->codec->channel_layout = av_get_default_channel_layout(_formatCtx->streams[_audioStream]->codec->channels);
+        //recordAudioStream->codec->strict_std_compliance = FF_COMPLIANCE_EXPERIMENTAL;
+        //recordAudioStream->codec->time_base.num = 1;
+        //recordAudioStream->codec->time_base.den = _formatCtx->streams[_audioStream]->codec->sample_rate;
+        //recordAudioStream->time_base.num = 1;
+        //recordAudioStream->time_base.den = _formatCtx->streams[_audioStream]->codec->sample_rate;
+        
+        if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
+            recordVideoStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+            //recordAudioStream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+        }
+        
+        //애플에 맞게 강제 세팅
+        oc->streams[_videoStream]->codec->codec_id = CODEC_ID_H264;
+        oc->streams[_videoStream]->codec->profile =  FF_PROFILE_H264_BASELINE;
+        oc->oformat->mime_type = "video/mp4";
+        oc->oformat->video_codec = AV_CODEC_ID_H264;
+        oc->video_codec_id = oc->oformat->video_codec;
+        
+        oc->oformat->audio_codec = AV_CODEC_ID_AAC;
+        oc->audio_codec_id = oc->oformat->audio_codec;
+        oc->oformat->long_name =oc->streams[_videoStream]->codec->codec->long_name;
+        
+        avformat_write_header(oc,NULL);
+        
+        //코덱정보 문제로 강제 세팅
+        if (recordBaseDen == 0 && recordPktBaseDen == 0) {
+            
+            recordBaseDen = _formatCtx->streams[_videoStream]->codec->pkt_timebase.den*_formatCtx->streams[_videoStream]->codec->ticks_per_frame;
+            recordPktBaseDen = av_q2d(_formatCtx->streams[_videoStream]->r_frame_rate);
+        }
+    }
+}
+
+- (UIImage *) getCurrentImage
+{
+    //
+    // http://www.aiuxian.com/article/p-2019255.html 참고.
+    //
+    
+    [self setupScaler];
+    [self convertFrameToRGB];
+    
+    return [self imageFromAVPicture:_picture width:(int)self.frameWidth height:(int)self.frameHeight];
+}
+
+- (void) recordStart
+{
+    if (!fmt) {
+        
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        NSString *documentsDirectory = [NSString stringWithFormat:@"%@/%@",[paths objectAtIndex:0], [KxManager recordFileName]];
+        NSLog(@"documentsDirectory : %@",documentsDirectory);
+        
+        const char *stringAsChar = [documentsDirectory cStringUsingEncoding:[NSString defaultCStringEncoding]];
+        //open output file
+        fmt = av_guess_format(NULL,stringAsChar,NULL);
+        oc = avformat_alloc_context();
+        oc->oformat = fmt;
+        
+        avio_open2(&oc->pb, stringAsChar, AVIO_FLAG_WRITE,NULL,NULL);
+        
+        recordVideoStream = NULL;
+        //recordAudioStream = NULL;
+        
+        isRecord = YES;
+        isFirstIframeRec = NO;
+    }
+}
+
+- (void) recordStop
+{
+    _pts = -1;
+    _dts = -1;
+    _audioPts = -1;
+    _audioDts = -1;
+    
+    isRecord = NO;
+    if (oc) {
+        av_write_trailer(oc);
+        avio_close(oc->pb);
+        avformat_free_context(oc);
+    }
+    
+    fmt = NULL;
+    oc = NULL;
+    recordVideoStream = NULL;
+    //recordAudioStream = NULL;
+}
+
+- (BOOL) isRecord
+{
+    return isRecord;
+}
+
 @end
 
 //////////////////////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////////////////////
+static int callbackCount = 0;
+static int callbackCount1 = 0;
+static int callbackCount2 = 0;
 
 static int interrupt_callback(void *ctx)
 {
+#ifdef KXVIDEO_VIEW_CUSTOM
+    if (!ctx)
+        return 0;
+    __unsafe_unretained KxMovieDecoder *p = (__bridge KxMovieDecoder *)ctx;
+    
+    const BOOL isStop = [p isStop];
+    const BOOL isCloseInput = [p isCloseInput];
+    
+    const BOOL r = [p interruptDecoder];
+    
+    //LoggerStream(1, @"isCloseInput : %d, %d,  %d", r, isStop, isCloseInput );
+    
+    if( !r && !isStop ){
+        callbackCount  = 0;
+        callbackCount1 = 0;
+        callbackCount2 = 0;
+        return 0;
+    }
+    
+    if(!r &&  [p isStop]){
+        
+        if( callbackCount1 <= 0 ){
+            callbackCount1++;
+            //sleep(1000);
+            [NSThread sleepForTimeInterval:1];
+            return 1;
+        }
+        callbackCount1++;
+        return 0;
+    }else if( r && [p isStop] && !isCloseInput ){  // close Audio/Video Stream 처리시
+        if( callbackCount2 <= 0 ){
+            callbackCount2++;
+            
+            [NSThread sleepForTimeInterval:1];
+            return 1;
+        }
+        callbackCount2++;
+        return 0;
+    }
+    
+    if( isCloseInput && isStop ){  // avformat_close_input 수행시("TEARDOWN" 전송)
+        //LoggerStream(1, @"isCloseInput : %d, %d,  %d", r, isStop, isCloseInput );
+        
+        if( callbackCount <= 0 ){
+            callbackCount++;
+            //[NSThread sleepForTimeInterval:1];
+            return 0;
+        }
+        
+        callbackCount++;
+        return 0;
+        
+    }
+    
+    return r; // 1;
+    
+    if (r)
+    {
+        LoggerStream(1, @"DEBUG: INTERRUPT_CALLBACK!");
+        
+    }
+    return r;
+
+#else //KXVIDEO_VIEW_CUSTOM
     if (!ctx)
         return 0;
     __unsafe_unretained KxMovieDecoder *p = (__bridge KxMovieDecoder *)ctx;
     const BOOL r = [p interruptDecoder];
     if (r) LoggerStream(1, @"DEBUG: INTERRUPT_CALLBACK!");
     return r;
+    
+#endif //KXVIDEO_VIEW_CUSTOM
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1640,7 +2277,10 @@ static void FFLog(void* context, int level, const char* format, va_list args) {
                 LoggerStream(2, @"%@", [message stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]);
                 break;
             default:
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
                 LoggerStream(3, @"%@", [message stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]]);
+#endif //KXVIDEO_VIEW_CUSTOM
                 break;
         }
     }

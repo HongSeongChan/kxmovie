@@ -11,6 +11,8 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <UIKit/UIKit.h>
+#import "KxLogger.h"
 
 extern NSString * kxmovieErrorDomain;
 
@@ -78,9 +80,12 @@ typedef enum {
 - (UIImage *) asImage;
 @end
 
+#ifdef KXVIDEO_VIEW_CUSTOM
+#else //KXVIDEO_VIEW_CUSTOM
 @interface KxSubtitleFrame : KxMovieFrame
 @property (readonly, nonatomic, strong) NSString *text;
 @end
+#endif //KXVIDEO_VIEW_CUSTOM
 
 typedef BOOL(^KxMovieDecoderInterruptCallback)();
 
@@ -96,17 +101,25 @@ typedef BOOL(^KxMovieDecoderInterruptCallback)();
 @property (readonly, nonatomic) NSUInteger frameHeight;
 @property (readonly, nonatomic) NSUInteger audioStreamsCount;
 @property (readwrite,nonatomic) NSInteger selectedAudioStream;
+#ifdef KXVIDEO_VIEW_CUSTOM
+@property (readonly, nonatomic) BOOL validVideo;
+@property (readonly, nonatomic) BOOL validAudio;
+#else //KXVIDEO_VIEW_CUSTOM
 @property (readonly, nonatomic) NSUInteger subtitleStreamsCount;
 @property (readwrite,nonatomic) NSInteger selectedSubtitleStream;
 @property (readonly, nonatomic) BOOL validVideo;
 @property (readonly, nonatomic) BOOL validAudio;
 @property (readonly, nonatomic) BOOL validSubtitles;
+#endif //KXVIDEO_VIEW_CUSTOM
 @property (readonly, nonatomic, strong) NSDictionary *info;
 @property (readonly, nonatomic, strong) NSString *videoStreamFormatName;
 @property (readonly, nonatomic) BOOL isNetwork;
 @property (readonly, nonatomic) CGFloat startTime;
 @property (readwrite, nonatomic) BOOL disableDeinterlacing;
 @property (readwrite, nonatomic, strong) KxMovieDecoderInterruptCallback interruptCallback;
+@property (nonatomic, assign)  BOOL isStop;
+@property (nonatomic, assign)  BOOL isCloseInput;
+
 
 + (id) movieDecoderWithContentPath: (NSString *) path
                              error: (NSError **) perror;
@@ -114,11 +127,20 @@ typedef BOOL(^KxMovieDecoderInterruptCallback)();
 - (BOOL) openFile: (NSString *) path
             error: (NSError **) perror;
 
--(void) closeFile;
+- (void) closeFile;
+- (void) closeDecode;
 
 - (BOOL) setupVideoFrameFormat: (KxVideoFrameFormat) format;
 
 - (NSArray *) decodeFrames: (CGFloat) minDuration;
+
+- (void) setPosition: (CGFloat)seconds;
+
+- (UIImage *) getCurrentImage;
+
+- (void) recordStart;
+- (void) recordStop;
+- (BOOL) isRecord;
 
 @end
 

@@ -205,7 +205,7 @@ static void mat4f_LoadOrtho(float left, float right, float bottom, float top, fl
 {
     KxVideoFrameRGB *rgbFrame = (KxVideoFrameRGB *)frame;
    
-    assert(rgbFrame.rgb.length == rgbFrame.width * rgbFrame.height * 3);
+//    assert(rgbFrame.rgb.length == rgbFrame.width * rgbFrame.height * 3);
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     
@@ -217,8 +217,8 @@ static void mat4f_LoadOrtho(float left, float right, float bottom, float top, fl
     glTexImage2D(GL_TEXTURE_2D,
                  0,
                  GL_RGB,
-                 frame.width,
-                 frame.height,
+                 (int)frame.width,
+                 (int)frame.height,
                  0,
                  GL_RGB,
                  GL_UNSIGNED_BYTE,
@@ -282,9 +282,9 @@ static void mat4f_LoadOrtho(float left, float right, float bottom, float top, fl
 {
     KxVideoFrameYUV *yuvFrame = (KxVideoFrameYUV *)frame;
     
-    assert(yuvFrame.luma.length == yuvFrame.width * yuvFrame.height);
-    assert(yuvFrame.chromaB.length == (yuvFrame.width * yuvFrame.height) / 4);
-    assert(yuvFrame.chromaR.length == (yuvFrame.width * yuvFrame.height) / 4);
+//    assert(yuvFrame.luma.length == yuvFrame.width * yuvFrame.height);
+//    assert(yuvFrame.chromaB.length == (yuvFrame.width * yuvFrame.height) / 4);
+//    assert(yuvFrame.chromaR.length == (yuvFrame.width * yuvFrame.height) / 4);
 
     const NSUInteger frameWidth = frame.width;
     const NSUInteger frameHeight = frame.height;    
@@ -302,16 +302,23 @@ static void mat4f_LoadOrtho(float left, float right, float bottom, float top, fl
         
         glBindTexture(GL_TEXTURE_2D, _textures[i]);
         
-        glTexImage2D(GL_TEXTURE_2D,
-                     0,
-                     GL_LUMINANCE,
-                     widths[i],
-                     heights[i],
-                     0,
-                     GL_LUMINANCE,
-                     GL_UNSIGNED_BYTE,
-                     pixels[i]);
-        
+        @try {
+            glTexImage2D(GL_TEXTURE_2D,
+                         0,
+                         GL_LUMINANCE,
+                         (int)widths[i],
+                         (int)heights[i],
+                         0,
+                         GL_LUMINANCE,
+                         GL_UNSIGNED_BYTE,
+                         pixels[i]);
+        }
+        @catch (NSException *exception) {
+            return;
+        }
+        @finally {
+        }
+
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -493,10 +500,31 @@ enum {
 	} else {
         
         LoggerVideo(1, @"OK setup GL framebuffer %d:%d", _backingWidth, _backingHeight);
+        LoggerVideo(1, @"==================== Start Video Stream(End : %@)=======================", [NSDate date]);
     }
     
     [self updateVertices];
     [self render: nil];
+}
+
+- (void)reloadSubView
+{
+    glBindRenderbuffer(GL_RENDERBUFFER, _renderbuffer);
+    [_context renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer*)self.layer];
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &_backingWidth);
+    glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &_backingHeight);
+    
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        
+        LoggerVideo(0, @"failed to make complete framebuffer object %x", status);
+        
+    } else {
+        
+        LoggerVideo(1, @"OK setup GL framebuffer %d:%d", _backingWidth, _backingHeight);
+    }
+    
+    [self updateVertices];
 }
 
 - (void)setContentMode:(UIViewContentMode)contentMode
@@ -564,8 +592,13 @@ exit:
 - (void)updateVertices
 {
     const BOOL fit      = (self.contentMode == UIViewContentModeScaleAspectFit);
+#ifdef KXVIDEO_VIEW_CUSTOM
+    const float width   = self.frame.size.width;
+    const float height  = self.frame.size.height;
+#else //KXVIDEO_VIEW_CUSTOM
     const float width   = _decoder.frameWidth;
     const float height  = _decoder.frameHeight;
+#endif //KXVIDEO_VIEW_CUSTOM
     const float dH      = (float)_backingHeight / height;
     const float dW      = (float)_backingWidth	  / width;
     const float dd      = fit ? MIN(dH, dW) : MAX(dH, dW);
@@ -593,11 +626,54 @@ exit:
 	
     [EAGLContext setCurrentContext:_context];
     
+#ifdef KXVIDEO_VIEW_CUSTOM
+    _backingWidth = self.superview.width;
+    _backingHeight= self.superview.height;
+    
+    float fOriginX = 0.0f;
+    float fOriginY = 0.0f;
+
+    if (([KxManager camType] == KxMovieCamTypeLG) ||
+        ([KxManager camType] == KxMovieCamTypeHanwha)) {
+        // HCPlayer
+        _backingWidth = self.superview.height * frame.width / frame.height;
+        fOriginX = (self.superview.width - _backingWidth) / 2;
+        
+        _backingHeight = self.superview.width * frame.height / frame.width;
+        fOriginY = (self.superview.height - _backingHeight) / 2;
+    }
+    else {
+        // LCPlayer 방식
+        UIInterfaceOrientation orientation = [[UIApplication sharedApplication] statusBarOrientation];
+        
+        if (UIInterfaceOrientationIsPortrait(orientation)) {
+            if (!IS_IPHONE_5 && !IS_IPHONE_6 && !IS_IPHONE_6P) {
+                _backingWidth = self.superview.height * frame.width / frame.height;
+                fOriginX = (self.superview.width - _backingWidth) / 2;
+            }
+        }
+        else {
+            _backingWidth = self.superview.height * frame.width / frame.height;
+            fOriginX = (self.superview.width - _backingWidth) / 2;
+        }
+        
+    }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, _framebuffer);
+    glViewport(fOriginX, fOriginY, _backingWidth, _backingHeight);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+	glUseProgram(_program);
+
+#else //KXVIDEO_VIEW_CUSTOM
     glBindFramebuffer(GL_FRAMEBUFFER, _framebuffer);
     glViewport(0, 0, _backingWidth, _backingHeight);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 	glUseProgram(_program);
+	
+#endif //KXVIDEO_VIEW_CUSTOM
+
         
     if (frame) {
         [_renderer setFrame:frame];        

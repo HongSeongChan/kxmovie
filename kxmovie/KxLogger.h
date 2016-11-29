@@ -34,4 +34,6 @@
 
 #endif
 
+#import "KxMovieManager.h"
+
 #endif
